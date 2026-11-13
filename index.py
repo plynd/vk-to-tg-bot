@@ -1,207 +1,70 @@
-"""
-VK -> Telegram: пересылка сообщений из бесед VK для Yandex Cloud Functions.
+# vk-to-telegram (Yandex Cloud Functions)
 
-Функция запускается таймером раз в минуту, берёт из VK новые сообщения выбранных
-бесед и отправляет их в Telegram. Id последнего обработанного сообщения хранится
-в Object Storage (файл state.json), потому что между запусками функция ничего не помнит.
-Зависимостей нет: только стандартная библиотека Python.
+Пересылает сообщения из бесед VK в личку Telegram-бота. Запускается таймером раз в
+минуту, зависимостей нет (только стандартная библиотека Python), весь код в `index.py`.
 
-Переменные окружения:
-  VK_TOKEN      токен пользователя VK (scope: messages, offline)
-  TG_BOT_TOKEN  токен бота от @BotFather
-  TG_CHAT_ID    твой chat_id в Telegram
-  VK_PEER_IDS   peer_id бесед через запятую (например 2000000012). Если пусто, функция
-                пишет в лог список твоих бесед с их peer_id (режим поиска).
-  BUCKET        имя бакета Object Storage для state.json
-  STATE_KEY     необязательно: имя файла состояния (по умолчанию state.json)
+Работает как serverless-функция Yandex Cloud Functions: постоянно включённый сервер не нужен,
+оплачиваются только короткие запуски (раз в минуту их около 43 тысяч в месяц, это укладывается
+в бесплатную квоту, актуальные лимиты смотри в тарифах Yandex Cloud).
 
-Точка входа функции: index.handler
-"""
-import json
-import os
-import urllib.error
-import urllib.parse
-import urllib.request
+## Установка
 
-VK_API = "https://api.vk.com/method/"
-VK_VERSION = "5.199"
-STORAGE = "https://storage.yandexcloud.net"
+1. **Telegram.** Создай бота у @BotFather, возьми токен. Свой `chat_id` узнай у @userinfobot
+   и напиши своему боту `/start`.
+2. **Токен VK.** Нужен пользовательский токен со scope `messages` и `offline`.
+   Токен даёт полный доступ к аккаунту: храни его как пароль и не коммить в репозиторий.
+3. **Бакет.** В Object Storage создай приватный бакет (в нём будет лежать `state.json`).
+4. **Сервисный аккаунт.** Создай сервисный аккаунт с ролью `storage.editor` на этот бакет
+   (или на каталог).
+5. **Функция.**
+   - Runtime: Python 3.12 (подойдёт любой 3.x), точка входа `index.handler`.
+   - Загрузи `index.py`, укажи сервисный аккаунт, таймаут 30 секунд, память 128 МБ.
+   - Переменные окружения: `VK_TOKEN`, `TG_BOT_TOKEN`, `TG_CHAT_ID`, `BUCKET`,
+     `VK_PEER_IDS`.
+     Секреты можно вынести в Lockbox.
+6. **Поиск беседы.** Оставь `VK_PEER_IDS` пустой, один раз запусти функцию вручную и
+   посмотри в логах `peer_id` нужной беседы. Впиши его в `VK_PEER_IDS` (несколько через запятую).
+7. **Таймер.** Создай триггер типа «Таймер» с cron-выражением `* * * * ? *` (каждую минуту),
+   целевая функция та же.
 
+## Переменные окружения
 
-def env(name, default=""):
-    return os.environ.get(name, default)
+| Переменная     | Обязательна | Описание                                                              |
+|----------------|-------------|-----------------------------------------------------------------------|
+| `VK_TOKEN`     | да          | Токен пользователя VK (scope `messages`, `offline`)                   |
+| `TG_BOT_TOKEN` | да          | Токен Telegram-бота от @BotFather                                     |
+| `TG_CHAT_ID`   | да          | Твой chat_id в Telegram                                               |
+| `BUCKET`       | да          | Имя бакета Object Storage, где хранится `state.json`                  |
+| `VK_PEER_IDS`  | нет         | `peer_id` бесед через запятую. Пусто: режим поиска, список бесед в логе |
+| `STATE_KEY`    | нет         | Имя файла состояния в бакете (по умолчанию `state.json`)              |
 
+## Как работает
 
-def http(url, data=None, headers=None, method=None, timeout=15):
-    req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read()
+- Раз в минуту читает последние 20 сообщений каждой выбранной беседы. Если новых накопилось
+  больше, дочитывает следующие страницы, пока не дойдёт до уже обработанного сообщения.
+- Номер последнего обработанного сообщения хранится в `state.json` в бакете.
+- При самом первом запуске старые сообщения не пересылаются, только новые.
+- Пересылаются текст, ответы, пересланные сообщения, фото (как фото), документы (как ссылка).
+- Свои сообщения пропускаются. Правки уже отправленных сообщений не отслеживаются.
+- За один запуск читается не больше 200 сообщений на беседу (`PAGE_SIZE * MAX_PAGES` в `index.py`).
+  Если за минуту их пришло больше, самые старые из этой пачки пропускаются.
+- Задержка между сообщением в VK и уведомлением в Telegram до минуты (интервал таймера).
 
+## Если что-то не работает
 
-# ---------- VK ----------
+- **В логе ошибка 403 при работе с бакетом.** У сервисного аккаунта функции нет роли
+  `storage.editor` или он не указан в настройках функции.
+- **Ошибка VK про токен или доступ.** Токен устарел или выдан без scope `messages`.
+  Получи новый и обнови `VK_TOKEN`.
+- **В Telegram ничего не приходит.** Проверь `TG_CHAT_ID` и что ты написал боту `/start`.
+  Ошибки отправки видны в логах функции.
+- **Пропали сообщения за какое-то время.** Если `state.json` удалён из бакета, функция при
+  следующем запуске заново запоминает текущую позицию и пересылает только то, что придёт после
+  этого, а сообщения за время простоя не пересылаются.
 
-def vk(method, **params):
-    params.update(access_token=env("VK_TOKEN"), v=VK_VERSION)
-    raw = http(VK_API + method, data=urllib.parse.urlencode(params).encode())
-    data = json.loads(raw)
-    if "error" in data:
-        raise RuntimeError(f"VK {method}: {data['error'].get('error_msg')}")
-    return data["response"]
+## Безопасность
 
-
-def chat_title(peer_id):
-    try:
-        info = vk("messages.getConversationsById", peer_ids=peer_id)["items"][0]
-        return info["chat_settings"]["title"]
-    except Exception:
-        return str(peer_id)
-
-
-def best_photo(photo):
-    return max(photo["sizes"], key=lambda s: s["width"] * s["height"])["url"]
-
-
-PAGE_SIZE = 20   # сколько сообщений читаем за один запрос
-MAX_PAGES = 10   # потолок: не больше PAGE_SIZE * MAX_PAGES = 200 сообщений за запуск
-
-
-def fetch_new(peer, last):
-    """Читает историю беседы страницами по PAGE_SIZE и останавливается, когда дошла
-    до уже обработанного сообщения (last). В обычную минуту это один запрос;
-    при всплеске дочитывает следующие страницы. Возвращает (сообщения, имена)."""
-    items, names = {}, {}
-    offset = 0
-    for _ in range(MAX_PAGES):
-        hist = vk("messages.getHistory", peer_id=peer, count=PAGE_SIZE, offset=offset, extended=1)
-        page = hist["items"]
-        for p in hist.get("profiles", []):
-            names[p["id"]] = f"{p['first_name']} {p['last_name']}"
-        for m in page:
-            items[m["id"]] = m  # словарь по id убирает дубли, если сообщения сдвинули страницы
-        # первый запуск (last is None) или дошли до обработанного: хватит
-        if not page or last is None or min(m["id"] for m in page) <= last:
-            break
-        offset += PAGE_SIZE
-    return list(items.values()), names
-
-
-def discover():
-    """Режим поиска: печатает в лог беседы и их peer_id."""
-    res = vk("messages.getConversations", count=50)
-    for item in res["items"]:
-        conv = item["conversation"]
-        if conv["peer"]["type"] == "chat":
-            print(f"peer_id={conv['peer']['id']}  беседа: {conv['chat_settings']['title']}")
-
-
-# ---------- Telegram ----------
-
-def tg(method, **params):
-    url = f"https://api.telegram.org/bot{env('TG_BOT_TOKEN')}/{method}"
-    params.setdefault("chat_id", env("TG_CHAT_ID"))
-    try:
-        raw = http(url, data=urllib.parse.urlencode(params).encode(), timeout=20)
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"Telegram {method}: {e.read().decode(errors='ignore')}")
-    return json.loads(raw)
-
-
-def build_text(msg, names, title):
-    def name(uid):
-        return names.get(uid, str(uid))
-
-    body = msg.get("text", "")
-    lines = []
-    if msg.get("reply_message"):
-        r = msg["reply_message"]
-        lines.append(f"↩️ {name(r['from_id'])}: {r.get('text', '')[:200]}")
-    for fwd in msg.get("fwd_messages", []):
-        lines.append(f"➡️ {name(fwd['from_id'])}: {fwd.get('text', '')}")
-
-    photos, other = [], []
-    for att in msg.get("attachments", []):
-        kind = att["type"]
-        if kind == "photo":
-            photos.append(best_photo(att["photo"]))
-        elif kind == "doc":
-            other.append(f"📎 {att['doc']['title']}: {att['doc']['url']}")
-        else:
-            other.append(f"[{kind}]")
-
-    head = f"💬 {title}\n👤 {name(msg['from_id'])}"
-    text = "\n".join([head, "", body] + lines + other).strip()
-    return text[:4000], photos
-
-
-# ---------- состояние в Object Storage ----------
-
-def state_url():
-    return f"{STORAGE}/{env('BUCKET')}/{env('STATE_KEY', 'state.json')}"
-
-
-def load_state(iam):
-    try:
-        raw = http(state_url(), headers={"X-YaCloud-SubjectToken": iam})
-        return json.loads(raw)
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return {}
-        raise
-
-
-def save_state(iam, state):
-    http(
-        state_url(),
-        data=json.dumps(state).encode(),
-        headers={"X-YaCloud-SubjectToken": iam, "Content-Type": "application/json"},
-        method="PUT",
-    )
-
-
-# ---------- основная логика ----------
-
-def handler(event, context):
-    peers = [int(x) for x in env("VK_PEER_IDS").split(",") if x.strip()]
-    if not peers:
-        discover()
-        return {"statusCode": 200, "body": "discovery mode: see logs"}
-
-    iam = context.token["access_token"]
-    state = load_state(iam)
-    changed = False
-
-    for peer in peers:
-        key = str(peer)
-        last = state.get(key)
-        items, names = fetch_new(peer, last)
-        if not items:
-            continue
-        newest = max(m["id"] for m in items)
-
-        if last is None:
-            # первый запуск: запоминаем текущую позицию, старое не пересылаем
-            state[key] = newest
-            changed = True
-            continue
-
-        cursor = last
-        fresh = sorted((m for m in items if m["id"] > last), key=lambda m: m["id"])
-        title = chat_title(peer) if fresh else ""
-        for msg in fresh:
-            if not msg.get("out"):  # свои сообщения не пересылаем
-                try:
-                    text, photos = build_text(msg, names, title)
-                    tg("sendMessage", text=text)
-                    for url in photos:
-                        tg("sendPhoto", photo=url)
-                except Exception as e:
-                    print("Ошибка отправки, продолжу в следующий запуск:", e)
-                    break
-            cursor = msg["id"]
-        if cursor != last:
-            state[key] = cursor
-            changed = True
-
-    if changed:
-        save_state(iam, state)
-    return {"statusCode": 200, "body": "ok"}
+- Токены задаются только переменными окружения функции (лучше через Lockbox), в репозитории
+  их быть не должно. Файл `.env`, если используешь, уже добавлен в `.gitignore`.
+- Токен VK даёт доступ ко всему аккаунту. Если он утёк, смени пароль VK или заверши сессии
+  в настройках безопасности.
