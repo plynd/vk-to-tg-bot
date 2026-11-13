@@ -11,7 +11,7 @@ VK -> Telegram: пересылка сообщений из бесед VK для 
   TG_BOT_TOKEN  токен бота от @BotFather
   TG_CHAT_ID    твой chat_id в Telegram
   VK_PEER_IDS   peer_id бесед через запятую (например 2000000012). Если пусто, функция
-                пишет в лог список твоих бесед с их peer_id (режим поиска).
+                возвращает в ответе (и пишет в лог) список твоих бесед с их peer_id.
   BUCKET        имя бакета Object Storage для state.json
   STATE_KEY     необязательно: имя файла состояния (по умолчанию state.json)
 
@@ -86,12 +86,16 @@ def fetch_new(peer, last):
 
 
 def discover():
-    """Режим поиска: печатает в лог беседы и их peer_id."""
+    """Режим поиска: печатает в лог и возвращает список бесед с их peer_id."""
     res = vk("messages.getConversations", count=50)
+    lines = []
     for item in res["items"]:
         conv = item["conversation"]
         if conv["peer"]["type"] == "chat":
-            print(f"peer_id={conv['peer']['id']}  беседа: {conv['chat_settings']['title']}")
+            line = f"peer_id={conv['peer']['id']}  беседа: {conv['chat_settings']['title']}"
+            print(line)
+            lines.append(line)
+    return "\n".join(lines) or "беседы не найдены"
 
 
 # ---------- Telegram ----------
@@ -141,7 +145,7 @@ def state_url():
 
 def load_state(iam):
     try:
-        raw = http(state_url(), headers={"X-YaCloud-SubjectToken": iam})
+        raw = http(state_url(), headers={"Authorization": f"Bearer {iam}"})
         return json.loads(raw)
     except urllib.error.HTTPError as e:
         if e.code == 404:
@@ -153,7 +157,7 @@ def save_state(iam, state):
     http(
         state_url(),
         data=json.dumps(state).encode(),
-        headers={"X-YaCloud-SubjectToken": iam, "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {iam}", "Content-Type": "application/json"},
         method="PUT",
     )
 
@@ -163,8 +167,7 @@ def save_state(iam, state):
 def handler(event, context):
     peers = [int(x) for x in env("VK_PEER_IDS").split(",") if x.strip()]
     if not peers:
-        discover()
-        return {"statusCode": 200, "body": "discovery mode: see logs"}
+        return {"statusCode": 200, "body": discover()}
 
     iam = context.token["access_token"]
     state = load_state(iam)
