@@ -13,7 +13,6 @@ VK -> Telegram: пересылка сообщений из бесед VK для 
   VK_PEER_IDS   peer_id бесед через запятую (например 2000000012). Если пусто, функция
                 пишет в лог список твоих бесед с их peer_id (режим поиска).
   BUCKET        имя бакета Object Storage для state.json
-  KEYWORDS      необязательно: слова через запятую, сообщения с ними помечаются 🚨
   STATE_KEY     необязательно: имя файла состояния (по умолчанию state.json)
 
 Точка входа функции: index.handler
@@ -62,6 +61,30 @@ def best_photo(photo):
     return max(photo["sizes"], key=lambda s: s["width"] * s["height"])["url"]
 
 
+PAGE_SIZE = 20   # сколько сообщений читаем за один запрос
+MAX_PAGES = 10   # потолок: не больше PAGE_SIZE * MAX_PAGES = 200 сообщений за запуск
+
+
+def fetch_new(peer, last):
+    """Читает историю беседы страницами по PAGE_SIZE и останавливается, когда дошла
+    до уже обработанного сообщения (last). В обычную минуту это один запрос;
+    при всплеске дочитывает следующие страницы. Возвращает (сообщения, имена)."""
+    items, names = {}, {}
+    offset = 0
+    for _ in range(MAX_PAGES):
+        hist = vk("messages.getHistory", peer_id=peer, count=PAGE_SIZE, offset=offset, extended=1)
+        page = hist["items"]
+        for p in hist.get("profiles", []):
+            names[p["id"]] = f"{p['first_name']} {p['last_name']}"
+        for m in page:
+            items[m["id"]] = m  # словарь по id убирает дубли, если сообщения сдвинули страницы
+        # первый запуск (last is None) или дошли до обработанного: хватит
+        if not page or last is None or min(m["id"] for m in page) <= last:
+            break
+        offset += PAGE_SIZE
+    return list(items.values()), names
+
+
 def discover():
     """Режим поиска: печатает в лог беседы и их peer_id."""
     res = vk("messages.getConversations", count=50)
@@ -105,10 +128,7 @@ def build_text(msg, names, title):
         else:
             other.append(f"[{kind}]")
 
-    keywords = [k.strip().lower() for k in env("KEYWORDS").split(",") if k.strip()]
-    alarm = "🚨 " if any(k in body.lower() for k in keywords) else ""
-
-    head = f"{alarm}💬 {title}\n👤 {name(msg['from_id'])}"
+    head = f"💬 {title}\n👤 {name(msg['from_id'])}"
     text = "\n".join([head, "", body] + lines + other).strip()
     return text[:4000], photos
 
@@ -152,14 +172,12 @@ def handler(event, context):
 
     for peer in peers:
         key = str(peer)
-        hist = vk("messages.getHistory", peer_id=peer, count=20, extended=1)
-        items = hist["items"]
+        last = state.get(key)
+        items, names = fetch_new(peer, last)
         if not items:
             continue
-        names = {p["id"]: f"{p['first_name']} {p['last_name']}" for p in hist.get("profiles", [])}
         newest = max(m["id"] for m in items)
 
-        last = state.get(key)
         if last is None:
             # первый запуск: запоминаем текущую позицию, старое не пересылаем
             state[key] = newest
